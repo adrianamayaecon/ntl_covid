@@ -1,2 +1,2 @@
 # ntl_covid
-Sample code for NTL-COVID paper
+Sample code for "Satellite Imagery Reveals Differing Pathways to Adaptation to a Global Shock"
