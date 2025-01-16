@@ -1,0 +1,348 @@
+---
+title: "fit_counterfactual_classify"
+author: "Adrian Amaya"
+date: "2023-05-23"
+output: html_document
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+
+```{r setup, include=FALSE}
+
+#This code fits trends to NTL for each country and classifies each country into one of four categories based on parameters from the models. 
+#Also produces csv files containing the data needed to make figures. 
+#Knit to produce html of all countries with fitted and counterfactual plots
+
+ntldata = "slmavg_sum"    # mavg_sum or slmavg_sum
+mask = "no"               # no or builtarea
+fittotrend = "linear_weighted"    # linear, linear_weighted
+time = "quarter"                  # month or quarter
+
+
+
+#Directories####
+
+ntldir = "G:/My Drive/Nightlights_Global/"
+datadir = paste0(ntldir, "data/")
+mtifdir = paste0(datadir, "viirs_monthly_tiffs/")
+atifdir = paste0(datadir, "viirs_annual_tiffs/")
+codedir = paste0(ntldir, "code/")
+figdir = paste0(ntldir, "figures/")
+
+
+#Stuff####
+`%!in%` = Negate(`%in%`)
+
+#Load libraries####
+
+library(tidyverse)
+library(sf)
+library(wbstats)
+library(fixest)
+library(ggplot2)
+
+#Check Inputs####
+
+if(ntldata %!in% c("mavg_sum", "slmavg_sum")){
+  stop(paste0("ntldata = ", ntldata, " not allowed"))
+}
+if(mask %!in% c("no", "builtarea")){
+  stop(paste0("mask = ", mask, " not allowed"))
+}
+if(fittotrend %!in% c("linear", "linear_weighted")){
+  stop(paste0("fittotrend = ", fittotrend, " not allowed"))
+}
+
+
+#BUILD FILENAMES ####
+
+if(mask=="no"){
+  ntlfile = paste0(mtifdir, "NTL_monthly_", ntldata,".csv")
+} 
+if(mask=="builtarea"){
+  ntlfile = paste0(mtifdir, "NTL_monthly_", ntldata, "_builtarea.csv")
+  ntldata = "slmavg_builtarea_sum"
+}
+
+```
+
+
+
+```{r BUN, warning=FALSE, include=FALSE}
+
+if(time=="month"){
+  cases = read.csv(paste0(datadir, "our-world-in-data/owid-covid-data.csv")) %>%
+      select(iso3c = iso_code, date, total_cases) %>%
+      mutate(date = as.Date(date, format = "%Y-%m-%d"),
+             covidmonth = format(date, "%Y-%m-01")) %>%
+      group_by(iso3c, covidmonth) %>%
+      summarise(
+        total_cases = max(total_cases, na.rm = TRUE)
+      ) %>%
+      mutate(
+        total_cases = case_when(total_cases == -Inf ~ NA_real_,
+                                     TRUE ~ total_cases)
+             ) %>%
+       slice(which.min(total_cases)) %>% select(covidmonth)
+}
+
+
+
+
+cfcvgmu = read.csv(paste0(mtifdir, "NTL_monthly_cfcvg_mean.csv"))
+selected = read.csv(paste0(datadir,"validation_selection.csv"))
+
+
+countries = read.csv(paste0(datadir,"countrycodes.csv")) %>% na.omit()
+
+capitalcities = countries %>%
+  left_join(., select(wb_cachelist$countries, iso3c, longitude, latitude), by = "iso3c") %>%
+  na.omit() %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84")
+
+
+```
+
+
+
+
+
+
+```{r LETTUCE, include=FALSE}
+
+# Sum of Lights
+
+if(time == "month"){
+  
+  sum = read.csv(ntlfile)%>%
+  left_join(., cases, by = "iso3c") %>% na.omit() %>%
+  mutate(ym = as.Date(with(., paste(year, month, 1, sep="-")), "%Y-%m-%d")) %>%
+  group_by(iso3c, country) %>% 
+  mutate(t = row_number() - which(ym == covidmonth[1]),
+         covid = ifelse(ym >= covidmonth,1,0),
+         precalibration = ifelse(year<2017, 1, 0)) %>%
+  ungroup() %>%
+  left_join(cfcvgmu, by = c("iso3c", "country", "month", "year"))
+
+  pre = sum %>%
+    filter(covid == 0) %>%
+    group_by(iso3c, country) %>%
+    mutate(premean = mean(!!as.name(ntldata), na.rm = TRUE),
+           presd = sd(!!as.name(ntldata), na.rm = TRUE)) %>%
+    select(iso3c, country, premean, presd) %>%
+    distinct() %>% ungroup()
+  
+  z = left_join(sum, pre, by = c("iso3c", "country")) %>%
+    left_join(., capitalcities, by = c("iso3c", "country")) %>%
+    group_by(iso3c, country) %>%
+    mutate(z = (!!as.name(ntldata) - premean) / presd) %>%
+    ungroup()
+  
+  predarkest = z %>%
+      filter(covid == 0) %>%
+      group_by(iso3c, country) %>%
+      arrange(desc(t)) %>%
+      slice_min(z, with_ties = F) %>%
+      ungroup() %>%
+      mutate(darkestpre = ym) %>%
+      select(iso3c, country, darkestpre, z)
+  
+  
+  countries = distinct(select(z, country, iso3c))
+  
+  rm(sum, pre)
+
+  
+}
+
+if(time == "quarter"){
+  
+  cfcvgmu = read.csv(paste0(mtifdir, "NTL_monthly_cfcvg_mean.csv")) %>%
+    mutate(ym = as.Date(with(., paste(year, month, 1, sep="-")), "%Y-%m-%d")) %>%
+    mutate(quarter = quarters(ym)) %>%
+    group_by(iso3c, country, quarter, year) %>%
+    summarize(cfcvg_mean = mean(cfcvg_mean))
+  
+  sum = read.csv(ntlfile)%>%
+    mutate(ym = as.Date(with(., paste(year, month, 1, sep="-")), "%Y-%m-%d")) %>%
+    mutate(quarter = quarters(ym)) %>%
+    left_join(., cfcvgmu, by=c("iso3c", "country", "quarter", "year")) %>%
+    group_by(iso3c, country, year, quarter) %>%
+    summarize(slmavg_sum = mean(!!as.name(ntldata))) %>%
+    group_by(iso3c, country) %>% 
+    mutate(t = row_number() - which(year == 2020 & quarter == "Q1")[1],
+           covid = ifelse(year >= 2020,1,0),
+           precalibration = ifelse(year < 2017,1,0),
+           covid1 = ifelse(year == 2020,1,0),
+           covid2 = ifelse(year > 2020,1,0)) %>%
+    ungroup() %>%
+    left_join(cfcvgmu, by = c("iso3c", "country", "quarter", "year"))
+
+  pre = sum %>%
+    filter(covid == 0) %>%
+    group_by(iso3c, country) %>%
+    mutate(premean = mean(slmavg_sum)) %>%
+    mutate(presd = sd(slmavg_sum)) %>%
+    select(iso3c, country, premean, presd) %>%
+    distinct() %>% ungroup()
+  
+  z = left_join(sum, pre, by = c("iso3c", "country")) %>%
+    left_join(., capitalcities, by = c("iso3c", "country")) %>%
+    group_by(iso3c, country) %>%
+    mutate(z = (slmavg_sum - premean) / presd) %>%
+    ungroup()
+    
+  
+  predarkest = z %>%
+      filter(covid == 0) %>%
+      group_by(iso3c, country) %>%
+      arrange(desc(t)) %>%
+      slice_min(z, with_ties = F) %>%
+      ungroup() %>%
+      select(iso3c, country, quarter, year, slmavg_sum)
+  
+  
+  countries = distinct(select(z, country, iso3c))
+  
+  rm(sum, pre)
+
+}
+
+
+```
+
+
+
+
+```{r MEAT, include=FALSE}
+
+# Build regression and apply to each country ##################
+
+
+equation = as.formula(paste0("z ~ t + precalibration + precalibration*t + covid1 + covid1*t + covid2 + covid2*t | factor(", time, ")"))
+
+    if (fittotrend == "linear"){
+    regression = function(x) {
+feols(equation, data = x)
+    }
+    df = split(z, z$country)
+    model = map(df, regression)
+    }
+  
+  if (fittotrend == "linear_weighted"){
+    regression = function(x) {
+feols(equation, weights=x$cfcvg_mean, data = x)
+    }
+    df = split(z, z$country)
+    model = map(df, regression)
+  }
+  
+
+# Get fitted values and construct counterfactuals #######################
+
+    df = list()
+    for(i in countries$country){
+      g = subset(z, country == i) %>%
+        mutate(fit = predict(model[[i]], newdata = .)) %>%
+        mutate(covid1 = 0,
+               covid2 = 0) %>%
+        mutate(counterfactual = predict(model[[i]], newdata = .))
+      df[[i]] = g
+    }
+    
+    df.final1 = bind_rows(df) %>%
+      select(country, !!as.name(time), year, fit, counterfactual) %>%
+      left_join(z, by = c("country", paste0(time), "year")) %>%
+      mutate(diff = (z - counterfactual),
+             over = case_when((fit >= counterfactual) & (covid == 1) ~ 1, 
+                              (fit < counterfactual) & (covid == 1) ~ 0))
+
+# OUTPUT: time series file for figures #######################
+    
+write.csv(df.final1 %>% 
+    select(country, iso3c, !!as.name(ntldata), !!as.name(time), year, t, z, fit, counterfactual), 
+    file = paste0("G:/My Drive/Nightlights_Global/data/", ntldata, "_z_fit_cf_", fittotrend, "_", time, ".csv"), 
+      row.names = F)
+    
+# Calculate differences between fitted values and counterfactuals #############
+  
+df1 = df.final1 %>%
+  group_by(iso3c, country) %>% arrange(country, t) %>%
+    mutate(firstdip = which(over==0)[1] - which(covid==1)[1],
+           por = which(over==1)[firstdip+1] - which(covid==1)[1],
+           time2recover = ifelse(firstdip %in% c(0,1,2,3), por - firstdip, NA_real_),
+           diff_q1 = case_when(year==2020 & quarter == "Q1" ~ diff,
+                               TRUE ~ NA_real_),
+           diff_2020 = case_when(year==2020 ~ diff,
+                                 TRUE ~ NA_real_),
+           diff_all = case_when(year>=2020 ~ diff, 
+                                  TRUE ~ NA_real_)) %>%
+    mutate(net_overall = sum(diff_all, na.rm = TRUE),
+           net_2020 = sum(diff_2020, na.rm = TRUE),
+           immediate = sum(diff_q1, na.rm = TRUE)) %>%
+    ungroup() %>%
+    select(iso3c, country, net_overall, net_2020, immediate, time2recover, por, firstdip) %>%
+    unique() 
+  
+# Pull coefficients of interest #############
+
+  df2 = data.frame(country = countries$country, iso3c = countries$iso3c, row.names = countries$country)
+      row.names(df2) = countries$country
+      for(i in countries$country){
+        df2[i,"covid"] = model[[i]][["coefficients"]][["covid1"]]
+        df2[i,"se_covid"] = model[[i]][["se"]][["covid1"]]
+        df2[i, "p_covid"] = pvalue(model[[i]])[["covid1"]]
+      }
+      rownames(df2) = NULL
+
+
+# Categorize countries into four groups #############
+  
+  df.final2 = df2 %>%
+    select(iso3c, country, covid, se_covid, p_covid) %>%
+    left_join(., df1, by = c("iso3c", "country")) %>%
+    mutate(type = case_when(covid > 0 & net_2020 > 0 ~ "unaffected",
+          (net_2020 < 0 | covid < 0) & is.na(por) ~ "never recovered",
+          (net_2020 < 0 | covid < 0) & !is.na(por) & net_overall>0 ~ "bbb",
+          (net_2020 < 0 | covid < 0) & !is.na(por) & net_overall <= 0 ~ "bot"))
+ 
+# OUTPUT: coefficients, impact parameters, type #######################
+       
+    write.csv(df.final2 %>% 
+                select(iso3c, country, covid, se_covid, p_covid, net_2020, net_overall, time2recover, por, firstdip, type), 
+              file = paste0("G:/My Drive/Nightlights_Global/data/", ntldata, "_coef_area_type_", fittotrend, "_", time, ".csv"),
+              row.names = F)
+
+```
+
+
+
+```{r PLATE, out.width="50%", echo=FALSE, results="asis"}
+ 
+  countrylist = select(countries, country) %>% unlist()
+ 
+  for(i in 1:length(countrylist)){
+    cat("\n\n ", countrylist[[i]], "\n")
+ 
+    p1 = ggplot(subset(df.final1, country==countrylist[[i]]), mapping = aes(x = t)) +
+      geom_point(aes(y = z)) + 
+      geom_line(aes(y = fit), linewidth=1, color="black") +
+      geom_line(aes(y = counterfactual), linetype = "dashed", linewidth=1, color="black")
+      labs(x="t", y="z", title="")
+ 
+ 
+    cat("<hr />", "\n\n")   
+    print(p1)
+    cat("<hr />", "\n\n")
+ 
+  }
+
+```

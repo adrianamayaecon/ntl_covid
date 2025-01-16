@@ -1,0 +1,194 @@
+---
+title: "Country-level annual NTL analysis"
+author: "Adrian Amaya"
+date: "2024-01-24"
+output: html_document
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+
+ntldata = "slmavg_sum"    # mavg_sum or slmavg_sum
+mask = "no"               # no or builtarea
+fittotrend = "linear"    # linear, linear_weighted
+time = "annual"                  # month or quarter
+
+
+maindir = "G:/My Drive/Nightlights_Global/"
+
+########################################################
+
+shpdir = paste0(maindir, "shapefiles/")
+datadir = paste0(maindir, "data/")
+mtifdir = paste0(maindir, "data/viirs_monthly_tiffs/")
+atifdir = paste0(maindir, "data/viirs_annual_tiffs/")
+codedir = paste0(maindir, "code/")
+
+
+
+# Load libraries
+library(tidyverse)
+library(ggplot2)
+library(wbstats)
+library(sf)
+
+#Stuff
+`%!in%` = Negate(`%in%`)
+
+
+#Build Filenames
+
+if(mask=="no"){
+  ntlfile = paste0(mtifdir, "NTL_annual_", ntldata,".csv")
+} 
+
+```
+
+
+
+```{r}
+
+
+
+# Import annual NTL data
+  sum = read.csv(paste0(atifdir, "NTL_annual_", ntldata, ".csv")) %>%
+    group_by(iso3c, country) %>% arrange(country, year) %>%
+    filter(year<=2021) %>%
+    mutate(t = row_number() - which(year == "2020"),
+           covid = ifelse(year >= 2020,1,0),
+           postcalibration = ifelse(year>=2017,1,0)) %>%
+    ungroup()
+
+  pre = sum %>%
+    filter(covid == 0) %>%
+    group_by(iso3c, country) %>%
+    mutate(premean = mean(!!as.name(ntldata), na.rm = TRUE),
+           presd = sd(!!as.name(ntldata), na.rm = TRUE)) %>%
+    select(iso3c, country, premean, presd) %>%
+    distinct() %>% ungroup()
+  
+  z = left_join(sum, pre, by = c("iso3c", "country")) %>%
+    group_by(iso3c, country) %>%
+    mutate(z = (!!as.name(ntldata) - premean) / presd) %>%
+    ungroup()
+  
+  predarkest = z %>%
+      filter(covid == 0) %>%
+      group_by(iso3c, country) %>%
+      arrange(desc(t)) %>%
+      slice_min(z, with_ties = F) %>%
+      ungroup() %>%
+      mutate(darkestpre = year) %>%
+      select(iso3c, country, darkestpre, z)
+  
+  
+  countries = distinct(select(z, country, iso3c))
+
+  
+```
+
+
+```{r}
+countrylist = z$country %>% unique()
+countries = select(z, country, iso3c) %>% unique()
+
+
+equation = as.formula(paste0("z ~ t + postcalibration + postcalibration*t + covid + covid*t"))
+
+    if (fittotrend == "linear"){
+    regression = function(x) {
+      lm(equation, data = x)
+    }
+    df = split(z, z$country)
+    model = map(df, regression)
+    }
+
+#Estimate counterfactual
+
+df = list()
+for(i in countrylist){
+  g = subset(z, country == i) %>%
+    mutate(fit = predict(model[[i]], newdata = .)) %>%
+    mutate(covid = 0) %>%
+    mutate(counterfactual = predict(model[[i]], newdata = .))
+  df[[i]] = g
+}
+
+df1 = bind_rows(df) %>%
+  mutate(covid = ifelse(year >= 2020,1,0),
+         diff = z - counterfactual,
+         over = case_when(counterfactual <= fit & covid == 1 ~ 1, 
+                          counterfactual > fit & covid == 1 ~ 0)) %>%
+  group_by(iso3c, country) %>% arrange(country, t) %>%
+    mutate(firstdip = which(over==0)[1] - which(covid==1)[1],
+           por = which(over==1)[firstdip+1] - which(covid==1)[1],
+           time2recover = ifelse(firstdip %in% c(0,1,2,3), por - firstdip, NA_real_),
+           diff_2020 = case_when(year==2020 ~ diff,
+                                 TRUE ~ NA_real_),
+           diff_all = case_when(year>=2020 ~ diff, 
+                                  TRUE ~ NA_real_)) %>%
+    mutate(net_overall = sum(diff_all, na.rm = TRUE),
+           net_2020 = sum(diff_2020, na.rm = TRUE)) %>%
+    ungroup() %>%
+    select(iso3c, country, net_overall, net_2020, time2recover, por, firstdip) %>%
+    unique() 
+
+df2 = data.frame(country = countries$country, iso3c = countries$iso3c, row.names = countries$country)
+row.names(df2) = countries$country
+
+for(i in countrylist){
+  df2[i,"covid"] = model[[i]][["coefficients"]][["covid"]]
+  df2[i,"se_covid"] = summary(model[[i]])$coef["covid", "Std. Error"]
+  df2[i, "p_covid"] = summary(model[[i]])$coef["covid", "Pr(>|t|)"]
+}
+rownames(df2) = NULL
+
+
+df.final2 = df2 %>% left_join(df1, by = c("country", "iso3c")) %>%
+    select(iso3c, country, covid, se_covid, p_covid) %>%
+    left_join(., df1, by = c("iso3c", "country")) %>%
+    mutate(type = case_when(covid > 0 & net_2020 > 0 ~ "unaffected",
+          (net_2020 < 0 | covid < 0) & is.na(por) ~ "never recovered",
+          (net_2020 < 0 | covid < 0) & !is.na(por) ~ "recovered"))
+
+
+  write.csv(df.final2 %>% 
+                select(iso3c, country, covid, se_covid, p_covid, net_2020, net_overall, time2recover, por, firstdip, type), 
+                file = paste0(datadir, "annualNTL_coef_area_type_linear", ".csv"),
+                row.names = F)
+
+
+```
+
+
+```{r echo=FALSE, out.width="33%", results="asis"}
+
+ #Create individual graphs for each country and save as PNG files
+ countrylist = sum$country %>% unique()
+ 
+ for (i in 1:length(countrylist)) {
+   
+   cat("\n", countrylist[[i]], "\n")
+ 
+   plotdata = sum %>% filter(country == countrylist[[i]])
+   
+   p1 = ggplot(plotdata, aes(x = year, y = !!as.name(ntldata))) +
+     geom_point() + geom_line() +
+     labs(title = paste("Annual NTL for", countrylist[[i]]),
+          x = "Year",
+          y = "NTL")
+   
+   cat("<hr />", "\n\n")
+   print(p1)
+   cat("<hr />", "\n\n")
+ }
+
+
+```
